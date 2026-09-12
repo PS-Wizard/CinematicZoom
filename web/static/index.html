@@ -27,6 +27,7 @@
         </div>
         <div class="viewport hidden" id="viewport">
           <video id="video" playsinline></video>
+          <div id="path-dots"></div>
           <div id="rect" class="rect hidden">
             <div class="handle nw" data-handle="nw"></div>
             <div class="handle ne" data-handle="ne"></div>
@@ -58,9 +59,15 @@
           <label>Easing
             <select id="easing">
               <option value="easeInOutCubic">ease in-out</option>
+              <option value="easeOutCubic">ease out</option>
+              <option value="easeInCubic">ease in</option>
               <option value="linear">linear</option>
             </select>
           </label>
+          <div class="pan-box">
+            <div id="pan-meta" class="pan-meta"></div>
+            <button type="button" id="btn-delete-pan" class="btn hidden">Remove pan</button>
+          </div>
           <button type="button" id="btn-delete" class="btn danger">Delete zoom</button>
         </div>
       </aside>
@@ -71,14 +78,27 @@
           <span id="clock" class="clock">0:00.00</span>
           <span class="muted" id="clock-dur">/ 0:00.00</span>
           <span class="spacer"></span>
-          <span class="hint">space play · arrows seek · n add zoom · del remove</span>
+          <span class="hint">add a window · hold it to draw the path · stay still to hold · space play</span>
         </div>
         <div class="timeline" id="timeline">
-          <div class="tl-track" id="tl-track">
-            <div id="tl-regions"></div>
-            <div id="playhead" class="playhead"></div>
+          <div class="tl-lane">
+            <span class="tl-lane-label">zoom</span>
+            <div class="tl-track" id="tl-track">
+              <div id="tl-regions"></div>
+              <div id="playhead" class="playhead"></div>
+            </div>
           </div>
-          <div class="tl-labels" id="tl-labels"></div>
+          <div class="tl-lane">
+            <span class="tl-lane-label">pan</span>
+            <div class="tl-track pan" id="pan-track" title="Hold the zoom window to draw its path">
+              <div id="pan-keys"></div>
+              <div id="playhead-pan" class="playhead"></div>
+            </div>
+          </div>
+          <div class="tl-labels-row">
+            <span class="tl-lane-label"></span>
+            <div class="tl-labels" id="tl-labels"></div>
+          </div>
         </div>
       </section>
     </div>

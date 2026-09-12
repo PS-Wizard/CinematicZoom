@@ -3,6 +3,7 @@ package ffmpeg
 import (
 	"fmt"
 	"math"
+	"sort"
 	"strings"
 )
 
@@ -13,14 +14,25 @@ type Rect struct {
 	H float64 `json:"h"`
 }
 
+type PathPoint struct {
+	ID string  `json:"id,omitempty"`
+	T  float64 `json:"t"`
+	X  float64 `json:"x"`
+	Y  float64 `json:"y"`
+	W  float64 `json:"w"`
+	H  float64 `json:"h"`
+}
+
 type Zoom struct {
-	ID       string  `json:"id"`
-	InStart  float64 `json:"inStart"`
-	InEnd    float64 `json:"inEnd"`
-	OutStart float64 `json:"outStart"`
-	OutEnd   float64 `json:"outEnd"`
-	Rect     Rect    `json:"rect"`
-	Easing   string  `json:"easing"`
+	ID        string      `json:"id"`
+	InStart   float64     `json:"inStart"`
+	InEnd     float64     `json:"inEnd"`
+	OutStart  float64     `json:"outStart"`
+	OutEnd    float64     `json:"outEnd"`
+	Rect      Rect        `json:"rect"`
+	Path      []PathPoint `json:"path,omitempty"`
+	Easing    string      `json:"easing"`
+	PanEasing string      `json:"panEasing,omitempty"`
 }
 
 func (z Zoom) valid() bool {
@@ -45,13 +57,13 @@ func (r Rect) pixels(w, h int) (x, y, cw, ch int) {
 	if ch < 2 {
 		ch = 2
 	}
-	x = even(int(math.Round(r.X * float64(w))))
-	y = even(int(math.Round(r.Y * float64(h))))
+	x = int(math.Round(r.X * float64(w)))
+	y = int(math.Round(r.Y * float64(h)))
 	if x+cw > w {
-		x = even(w - cw)
+		x = w - cw
 	}
 	if y+ch > h {
-		y = even(h - ch)
+		y = h - ch
 	}
 	if x < 0 {
 		x = 0
@@ -79,14 +91,31 @@ func lerp(a, b, t float64) float64 {
 
 func ease(p float64, kind string) float64 {
 	p = clamp(p, 0, 1)
-	if strings.EqualFold(kind, "linear") {
+	switch strings.ToLower(kind) {
+	case "linear":
 		return p
+	case "easeincubic":
+		return p * p * p
+	case "easeoutcubic":
+		u := 1 - p
+		return 1 - u*u*u
+	default:
+		if p < 0.5 {
+			return 4 * p * p * p
+		}
+		u := -2*p + 2
+		return 1 - u*u*u/2
 	}
-	if p < 0.5 {
-		return 4 * p * p * p
+}
+
+func panEaseKind(z Zoom) string {
+	if strings.TrimSpace(z.PanEasing) != "" {
+		return z.PanEasing
 	}
-	u := -2*p + 2
-	return 1 - u*u*u/2
+	if strings.TrimSpace(z.Easing) != "" {
+		return z.Easing
+	}
+	return "easeInOutCubic"
 }
 
 func amountFor(z Zoom, t float64) float64 {
@@ -104,6 +133,48 @@ func amountFor(z Zoom, t float64) float64 {
 	return 1 - ease((t-z.OutStart)/d, z.Easing)
 }
 
+func pathPoints(z Zoom) []PathPoint {
+	if len(z.Path) == 0 {
+		return nil
+	}
+	pts := append([]PathPoint(nil), z.Path...)
+	sort.Slice(pts, func(i, j int) bool { return pts[i].T < pts[j].T })
+	return pts
+}
+
+func rectAt(z Zoom, t float64) Rect {
+	pts := pathPoints(z)
+	if len(pts) == 0 {
+		return z.Rect
+	}
+	first := pts[0]
+	if t < first.T {
+		return z.Rect
+	}
+	if t <= first.T || len(pts) == 1 {
+		return Rect{X: first.X, Y: first.Y, W: first.W, H: first.H}
+	}
+	last := pts[len(pts)-1]
+	if t >= last.T {
+		return Rect{X: last.X, Y: last.Y, W: last.W, H: last.H}
+	}
+	for i := 1; i < len(pts); i++ {
+		if t > pts[i].T {
+			continue
+		}
+		a, b := pts[i-1], pts[i]
+		d := math.Max(b.T-a.T, 0.0001)
+		p := ease((t-a.T)/d, panEaseKind(z))
+		return Rect{
+			X: lerp(a.X, b.X, p),
+			Y: lerp(a.Y, b.Y, p),
+			W: lerp(a.W, b.W, p),
+			H: lerp(a.H, b.H, p),
+		}
+	}
+	return z.Rect
+}
+
 func CropAt(zooms []Zoom, t float64, w, h int) (x, y, cw, ch int) {
 	for _, z := range zooms {
 		if !z.valid() {
@@ -113,11 +184,12 @@ func CropAt(zooms []Zoom, t float64, w, h int) (x, y, cw, ch int) {
 		if a <= 0 {
 			continue
 		}
+		target := rectAt(z, t)
 		r := Rect{
-			X: lerp(0, z.Rect.X, a),
-			Y: lerp(0, z.Rect.Y, a),
-			W: lerp(1, z.Rect.W, a),
-			H: lerp(1, z.Rect.H, a),
+			X: lerp(0, target.X, a),
+			Y: lerp(0, target.Y, a),
+			W: lerp(1, target.W, a),
+			H: lerp(1, target.H, a),
 		}
 		return r.pixels(w, h)
 	}
@@ -134,9 +206,7 @@ func HasZooms(zooms []Zoom) bool {
 }
 
 func BuildSendCmd(zooms []Zoom, w, h int, fps, duration float64) string {
-	if fps <= 0 {
-		fps = 30
-	}
+	fps = snapFPS(fps)
 	if duration <= 0 {
 		duration = 0
 		for _, z := range zooms {
@@ -163,12 +233,13 @@ func BuildSendCmd(zooms []Zoom, w, h int, fps, duration float64) string {
 	return b.String()
 }
 
-func BuildVideoFilter(cmdPath string, w, h int) string {
+func BuildVideoFilter(cmdPath string, w, h int, fps float64) string {
 	p := strings.ReplaceAll(cmdPath, `\`, `\\`)
 	p = strings.ReplaceAll(p, `'`, `\'`)
 	p = strings.ReplaceAll(p, `:`, `\:`)
+	rate := formatFPS(fps)
 	return fmt.Sprintf(
-		"sendcmd=f='%s',crop@z=w=%d:h=%d:x=0:y=0:exact=1,scale=%d:%d:flags=lanczos,setsar=1",
-		p, w, h, w, h,
+		"fps=fps=%s,format=yuv444p,sendcmd=f='%s',crop@z=w=%d:h=%d:x=0:y=0:exact=1,scale=%d:%d:flags=lanczos+accurate_rnd+full_chroma_int,format=yuv420p,setsar=1",
+		rate, p, w, h, w, h,
 	)
 }

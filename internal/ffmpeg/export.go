@@ -32,7 +32,7 @@ func DetectEncoder() Encoder {
 				"-rc", "constqp",
 				"-qp", "16",
 				"-bf", "0",
-				"-spatial-aq", "1",
+				"-spatial-aq", "0",
 				"-pix_fmt", "yuv420p",
 			},
 		}
@@ -52,6 +52,7 @@ func DetectEncoder() Encoder {
 				"-c:v", "libx264",
 				"-crf", "16",
 				"-preset", "fast",
+				"-tune", "animation",
 				"-bf", "0",
 				"-pix_fmt", "yuv420p",
 			},
@@ -88,10 +89,7 @@ func Export(ctx context.Context, opts ExportOpts, progress ProgressFunc) error {
 	if !HasZooms(opts.Zooms) {
 		args = append(args, "-c", "copy", "-avoid_negative_ts", "make_zero")
 	} else {
-		fps := opts.Probe.FPS
-		if fps <= 0 {
-			fps = 60
-		}
+		fps := snapFPS(opts.Probe.FPS)
 		cmdFile, err := os.CreateTemp("", "cinematic-*.cmd")
 		if err != nil {
 			return fmt.Errorf("sendcmd file: %w", err)
@@ -104,8 +102,8 @@ func Export(ctx context.Context, opts ExportOpts, progress ProgressFunc) error {
 		if err := cmdFile.Close(); err != nil {
 			return err
 		}
-		filter := BuildVideoFilter(cmdFile.Name(), opts.Probe.Width, opts.Probe.Height)
-		args = append(args, "-vf", filter)
+		filter := BuildVideoFilter(cmdFile.Name(), opts.Probe.Width, opts.Probe.Height, fps)
+		args = append(args, "-vf", filter, "-r", formatFPS(fps), "-fps_mode", "cfr")
 		args = append(args, opts.Encoder.Args...)
 		if opts.Probe.HasAudio {
 			if copyAudio(opts.Probe.AudioCodec) {
