@@ -71,6 +71,8 @@ type ExportOpts struct {
 	Speedups  []Speedup
 	CropStart float64
 	CropEnd   float64
+	ScaleW    int
+	ScaleH    int
 	Encoder   Encoder
 }
 
@@ -131,7 +133,8 @@ func Export(ctx context.Context, opts ExportOpts, progress ProgressFunc) error {
 	args = append(args, "-i", opts.Source)
 
 	speed := HasSpeedups(speedups)
-	if !HasZooms(zooms) && !speed && !trim {
+	scaled := opts.ScaleW > 0 && opts.ScaleH > 0
+	if !HasZooms(zooms) && !speed && !trim && !scaled {
 		args = append(args, "-c", "copy", "-avoid_negative_ts", "make_zero")
 	} else {
 		fps := opts.Probe.FPS
@@ -158,6 +161,9 @@ func Export(ctx context.Context, opts ExportOpts, progress ProgressFunc) error {
 		}
 		if speed {
 			filter += "," + BuildSetpts(speedups)
+		}
+		if scaled {
+			filter += fmt.Sprintf(",scale=%d:%d:flags=lanczos+accurate_rnd+full_chroma_int,setsar=1", opts.ScaleW, opts.ScaleH)
 		}
 		args = append(args, "-vf", filter, "-fps_mode", "passthrough")
 		args = append(args, opts.Encoder.Args...)

@@ -144,6 +144,15 @@
       <strong>Export</strong>
       <button type="button" class="btn" data-close>Close</button>
     </div>
+    <label class="full">Quality
+      <select id="export-preset">
+        <option value="default">Default — fast, hardware if available</option>
+        <option value="smooth">Smooth — motion first, big files</option>
+        <option value="quality">Quality — detail first, big files</option>
+        <option value="small">Small — compact, 1600×1000</option>
+        <option value="tiny">Tiny — smallest, 1280×800</option>
+      </select>
+    </label>
     <label class="full">Output
       <input id="export-path" type="text" spellcheck="false">
     </label>

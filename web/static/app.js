@@ -879,6 +879,7 @@ async function runExport() {
         speeds: state.speeds,
         cropStart: state.cropStart,
         cropEnd: cropEndTime(),
+        preset: localStorage.getItem("cinematic.preset") || "default",
       }),
     });
     if (!res.ok && !res.body) {
@@ -1010,12 +1011,12 @@ async function main() {
   $("#btn-save").addEventListener("click", () => saveProject().catch((e) => alert(e.message)));
   $("#btn-export").addEventListener("click", () => {
     $("#export-path").value = defaultOutput();
-    $("#progress-bar").style.width = "0%";
-    $("#export-status").textContent = `Ready · ${state.encoder}`;
     $("#export-log").textContent = "";
+    $("#export-preset").value = localStorage.getItem("cinematic.preset") || "default";
     $("#dlg-export").showModal();
   });
   $("#btn-run-export").addEventListener("click", runExport);
+  $("#export-preset").addEventListener("change", () => localStorage.setItem("cinematic.preset", $("#export-preset").value));
   $("#btn-play").addEventListener("click", togglePlay);
 
   video.addEventListener("play", () => {

@@ -248,6 +248,7 @@ type exportReq struct {
 	Speeds    []ffmpeg.Speedup `json:"speeds"`
 	CropStart float64          `json:"cropStart"`
 	CropEnd   float64          `json:"cropEnd"`
+	Preset    string           `json:"preset"`
 }
 
 func (s *Server) handleExport(w http.ResponseWriter, r *http.Request) {
@@ -309,9 +310,11 @@ func (s *Server) handleExport(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	preset := ffmpeg.ResolvePreset(req.Preset)
 	send(map[string]any{
 		"type":    "start",
-		"encoder": s.encoder.Name,
+		"encoder": preset.Encoder.Name,
+		"preset":  preset.Name,
 		"output":  out,
 	})
 
@@ -323,7 +326,9 @@ func (s *Server) handleExport(w http.ResponseWriter, r *http.Request) {
 		Speedups:  req.Speeds,
 		CropStart: req.CropStart,
 		CropEnd:   req.CropEnd,
-		Encoder:   s.encoder,
+		ScaleW:    preset.ScaleW,
+		ScaleH:    preset.ScaleH,
+		Encoder:   preset.Encoder,
 	}, func(ratio, timeSec float64, line string) {
 		if line != "" {
 			send(map[string]any{"type": "log", "line": line})
