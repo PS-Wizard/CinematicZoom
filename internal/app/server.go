@@ -181,7 +181,7 @@ func (s *Server) handleGetProject(w http.ResponseWriter, r *http.Request) {
 	data, err := os.ReadFile(sidecarPath(p))
 	if err != nil {
 		if os.IsNotExist(err) {
-			writeJSON(w, map[string]any{"source": p, "zooms": []any{}})
+			writeJSON(w, map[string]any{"source": p, "zooms": []any{}, "speeds": []any{}, "cropStart": 0, "cropEnd": 0})
 			return
 		}
 		httpError(w, http.StatusInternalServerError, err)
@@ -192,8 +192,11 @@ func (s *Server) handleGetProject(w http.ResponseWriter, r *http.Request) {
 }
 
 type projectFile struct {
-	Source string        `json:"source"`
-	Zooms  []ffmpeg.Zoom `json:"zooms"`
+	Source    string           `json:"source"`
+	Zooms     []ffmpeg.Zoom    `json:"zooms"`
+	Speeds    []ffmpeg.Speedup `json:"speeds"`
+	CropStart float64          `json:"cropStart,omitempty"`
+	CropEnd   float64          `json:"cropEnd,omitempty"`
 }
 
 func (s *Server) handlePutProject(w http.ResponseWriter, r *http.Request) {
@@ -239,9 +242,12 @@ func (s *Server) handleMedia(w http.ResponseWriter, r *http.Request) {
 }
 
 type exportReq struct {
-	Source string        `json:"source"`
-	Output string        `json:"output"`
-	Zooms  []ffmpeg.Zoom `json:"zooms"`
+	Source    string           `json:"source"`
+	Output    string           `json:"output"`
+	Zooms     []ffmpeg.Zoom    `json:"zooms"`
+	Speeds    []ffmpeg.Speedup `json:"speeds"`
+	CropStart float64          `json:"cropStart"`
+	CropEnd   float64          `json:"cropEnd"`
 }
 
 func (s *Server) handleExport(w http.ResponseWriter, r *http.Request) {
@@ -310,11 +316,14 @@ func (s *Server) handleExport(w http.ResponseWriter, r *http.Request) {
 	})
 
 	err = ffmpeg.Export(r.Context(), ffmpeg.ExportOpts{
-		Source:  src,
-		Output:  out,
-		Probe:   probe,
-		Zooms:   req.Zooms,
-		Encoder: s.encoder,
+		Source:    src,
+		Output:    out,
+		Probe:     probe,
+		Zooms:     req.Zooms,
+		Speedups:  req.Speeds,
+		CropStart: req.CropStart,
+		CropEnd:   req.CropEnd,
+		Encoder:   s.encoder,
 	}, func(ratio, timeSec float64, line string) {
 		if line != "" {
 			send(map[string]any{"type": "log", "line": line})

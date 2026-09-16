@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"math"
 	"os/exec"
 	"strconv"
 	"strings"
@@ -16,6 +15,7 @@ type Probe struct {
 	Width      int     `json:"width"`
 	Height     int     `json:"height"`
 	FPS        float64 `json:"fps"`
+	PeakFPS    float64 `json:"-"`
 	HasAudio   bool    `json:"hasAudio"`
 	VideoCodec string  `json:"videoCodec"`
 	AudioCodec string  `json:"audioCodec,omitempty"`
@@ -58,7 +58,7 @@ func ProbeFile(ctx context.Context, path string) (*Probe, error) {
 		return nil, fmt.Errorf("parse ffprobe: %w", err)
 	}
 
-	p := &Probe{Path: path, FPS: 60}
+	p := &Probe{Path: path, FPS: 60, PeakFPS: 60}
 	if d, err := strconv.ParseFloat(parsed.Format.Duration, 64); err == nil {
 		p.Duration = d
 	}
@@ -73,11 +73,13 @@ func ProbeFile(ctx context.Context, path string) (*Probe, error) {
 			p.Height = s.Height
 			p.VideoCodec = s.CodecName
 			if fps := parseFPS(s.RFrameRate); fps > 0 {
-				p.FPS = fps
-			} else if fps := parseFPS(s.AvgFrameRate); fps > 0 {
-				p.FPS = fps
+				p.PeakFPS = fps
 			}
-			p.FPS = snapFPS(p.FPS)
+			if fps := parseFPS(s.AvgFrameRate); fps > 0 {
+				p.FPS = fps
+			} else {
+				p.FPS = p.PeakFPS
+			}
 			if p.Duration == 0 {
 				if d, err := strconv.ParseFloat(s.Duration, 64); err == nil {
 					p.Duration = d
@@ -113,26 +115,6 @@ func parseFPS(r string) float64 {
 		return 0
 	}
 	return a / b
-}
-
-func snapFPS(fps float64) float64 {
-	if fps <= 0 {
-		return 60
-	}
-	for _, n := range []float64{24, 25, 30, 48, 50, 60, 72, 75, 90, 120, 144, 165, 240} {
-		if math.Abs(fps-n) < 0.51 {
-			return n
-		}
-	}
-	return fps
-}
-
-func formatFPS(fps float64) string {
-	fps = snapFPS(fps)
-	if fps == math.Trunc(fps) && fps >= 1 {
-		return strconv.FormatInt(int64(fps), 10)
-	}
-	return strconv.FormatFloat(fps, 'f', 3, 64)
 }
 
 func wrapExecErr(err error) error {

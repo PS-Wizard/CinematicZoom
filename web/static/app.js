@@ -6,9 +6,11 @@ const state = {
   path: null,
   probe: null,
   zooms: [],
+  speeds: [],
+  cropStart: 0,
+  cropEnd: null,
   selectedId: null,
-  selectedPathId: null,
-  drawing: null,
+  selectedSpeedId: null,
   dirty: false,
 };
 
@@ -19,10 +21,6 @@ const stage = $("#stage");
 
 let dragging = null;
 
-const HOLD_MS = 200;
-const HOLD_MOVE_PX = 8;
-const SAMPLE_DT = 0.08;
-const SAMPLE_DIST = 0.025;
 
 function fmtTime(s) {
   if (!Number.isFinite(s) || s < 0) s = 0;
@@ -49,72 +47,92 @@ function ease(p, kind) {
   }
 }
 
-function panEaseKind(z) {
-  return z.panEasing || z.easing || "easeInOutCubic";
-}
 
-function uid() {
-  return "z_" + Math.random().toString(36).slice(2, 8);
+function uid(p = "z_") {
+  return p + Math.random().toString(36).slice(2, 8);
 }
 
 function duration() {
   return state.probe?.duration ?? video.duration ?? 0;
 }
 
+function cropEndTime() {
+  return Number.isFinite(state.cropEnd) ? state.cropEnd : duration();
+}
+
+function clampCrop() {
+  const dur = duration();
+  state.cropStart = Math.min(Math.max(0, state.cropStart || 0), Math.max(0, dur - 0.05));
+  state.cropEnd = Math.min(dur, Math.max(state.cropStart + 0.05, cropEndTime()));
+}
+
 function selected() {
   return state.zooms.find((z) => z.id === state.selectedId) ?? null;
 }
 
-function zoomAt(t) {
-  return state.zooms.find((z) => t >= z.inStart && t <= z.outEnd) ?? null;
+function selectedSpeed() {
+  return state.speeds.find((s) => s.id === state.selectedSpeedId) ?? null;
 }
 
-function amountFor(z, t) {
-  if (t <= z.inStart || t >= z.outEnd) return 0;
+function sortedZooms() {
+  return state.zooms
+    .filter((z) => z.outEnd > z.inStart && z.rect?.w > 0 && z.rect?.h > 0)
+    .sort((a, b) => a.inStart - b.inStart);
+}
+
+function mixRect(a, b, p) {
+  return {
+    x: lerp(a.x, b.x, p),
+    y: lerp(a.y, b.y, p),
+    w: lerp(a.w, b.w, p),
+    h: lerp(a.h, b.h, p),
+  };
+}
+
+function cameraRectAt(t) {
+  const full = { x: 0, y: 0, w: 1, h: 1 };
+  const zs = sortedZooms();
+  let i = -1;
+  for (let n = 0; n < zs.length && t >= zs[n].inStart; n++) i = n;
+  if (i < 0) return full;
+
+  const z = zs[i];
+  const from = i > 0 ? zs[i - 1].rect : full;
   if (t < z.inEnd) {
-    const d = Math.max(z.inEnd - z.inStart, 0.0001);
-    return ease((t - z.inStart) / d, z.easing);
+    const p = ease((t - z.inStart) / Math.max(z.inEnd - z.inStart, 0.0001), z.easing);
+    return mixRect(from, z.rect, p);
   }
-  if (t <= z.outStart) return 1;
-  const d = Math.max(z.outEnd - z.outStart, 0.0001);
-  return 1 - ease((t - z.outStart) / d, z.easing);
-}
-
-function normalizePath(z) {
-  if (!z) return;
-  if (!Array.isArray(z.path)) z.path = [];
-  for (const p of z.path) {
-    if (!p.id) p.id = uid();
-    if (!Number.isFinite(p.w)) p.w = z.rect?.w ?? 0.5;
-    if (!Number.isFinite(p.h)) p.h = p.w;
+  if (i === zs.length - 1 && t > z.outStart) {
+    const p = ease((t - z.outStart) / Math.max(z.outEnd - z.outStart, 0.0001), z.easing);
+    return mixRect(z.rect, full, p);
   }
-  z.path.sort((a, b) => a.t - b.t);
+  return copyRect(z.rect);
 }
 
-function windowDist(a, b) {
-  if (!a || !b) return Infinity;
-  return Math.hypot(a.x - b.x, a.y - b.y) + Math.abs((a.w ?? 0) - (b.w ?? 0));
+function speedAt(t) {
+  const s = state.speeds.find((s) => t >= s.start && t < s.end);
+  return s && s.factor > 0 ? s.factor || 2 : 1;
 }
 
-function sameWindow(a, b) {
-  return windowDist(a, b) < 0.012;
+function clampSpeed(s) {
+  const dur = duration();
+  s.start = Math.max(0, s.start);
+  s.end = Math.min(dur, Math.max(s.start + 0.1, s.end));
+  s.factor = Math.min(4, Math.max(0.25, Number.isFinite(s.factor) ? s.factor : 2));
 }
 
-function simplifyPath(z) {
-  if (!z || !Array.isArray(z.path) || z.path.length < 3) return;
-  normalizePath(z);
-  const pts = z.path;
-  const out = [];
-  let i = 0;
-  while (i < pts.length) {
-    let j = i;
-    while (j + 1 < pts.length && sameWindow(pts[i], pts[j + 1])) j++;
-    out.push(pts[i]);
-    if (j > i && pts[j].t - pts[i].t > 0.08) out.push(pts[j]);
-    i = j + 1;
-  }
-  z.path = out;
+function addSpeed() {
+  if (!state.probe) return;
+  const t = video.currentTime;
+  const s = { id: uid("s_"), start: t, end: t + 2, factor: 2 };
+  clampSpeed(s);
+  state.speeds.push(s);
+  state.selectedId = null;
+  state.selectedSpeedId = s.id;
+  markDirty();
+  sync();
 }
+
 
 function copyRect(p) {
   return { x: p.x, y: p.y, w: p.w, h: p.h };
@@ -128,49 +146,20 @@ function clampRect(r) {
   return r;
 }
 
-function rectAt(z, t) {
-  normalizePath(z);
-  const pts = z.path;
-  if (!pts.length) return copyRect(z.rect);
-  if (t < pts[0].t) return copyRect(z.rect);
-  if (t <= pts[0].t || pts.length === 1) return copyRect(pts[0]);
-  const last = pts[pts.length - 1];
-  if (t >= last.t) return copyRect(last);
-  for (let i = 1; i < pts.length; i++) {
-    if (t > pts[i].t) continue;
-    const a = pts[i - 1];
-    const b = pts[i];
-    const p = ease((t - a.t) / Math.max(b.t - a.t, 0.0001), panEaseKind(z));
-    return {
-      x: lerp(a.x, b.x, p),
-      y: lerp(a.y, b.y, p),
-      w: lerp(a.w, b.w, p),
-      h: lerp(a.h, b.h, p),
-    };
-  }
-  return copyRect(z.rect);
-}
-
 function displayRect(z) {
-  if (state.drawing === z && dragging?.live) return copyRect(dragging.live);
-  const t = Math.min(z.outEnd, Math.max(z.inStart, video.currentTime));
-  return rectAt(z, t);
+  return copyRect(z.rect);
 }
 
 function applyPreview() {
   const t = video.currentTime;
-  const z = zoomAt(t);
-  if (!z || video.paused || state.drawing) {
+  const want = speedAt(t);
+  if (video.playbackRate !== want) video.playbackRate = want;
+  if (video.paused) {
     video.style.transform = "";
     return;
   }
-  const a = amountFor(z, t);
-  const r = rectAt(z, t);
-  const nx = lerp(0, r.x, a);
-  const ny = lerp(0, r.y, a);
-  const nw = lerp(1, r.w, a);
-  const nh = lerp(1, r.h, a);
-  video.style.transform = `scale(${1 / nw}, ${1 / nh}) translate(${-nx * 100}%, ${-ny * 100}%)`;
+  const r = cameraRectAt(t);
+  video.style.transform = `scale(${1 / r.w}, ${1 / r.h}) translate(${-r.x * 100}%, ${-r.y * 100}%)`;
 }
 
 function layoutViewport() {
@@ -190,10 +179,8 @@ function layoutViewport() {
 
 function renderRect() {
   const z = selected();
-  const show = z && (video.paused || state.drawing === z);
-  rectEl.classList.toggle("hidden", !show);
-  rectEl.classList.toggle("drawing", !!(z && state.drawing === z));
-  if (!show) return;
+  rectEl.classList.toggle("hidden", !z || !video.paused);
+  if (!z || !video.paused) return;
   const r = displayRect(z);
   rectEl.style.left = `${r.x * 100}%`;
   rectEl.style.top = `${r.y * 100}%`;
@@ -201,52 +188,6 @@ function renderRect() {
   rectEl.style.height = `${r.h * 100}%`;
 }
 
-function renderPathDots() {
-  const wrap = $("#path-dots");
-  if (!wrap) return;
-  wrap.innerHTML = "";
-  const z = selected();
-  if (!z || !video.paused) return;
-  normalizePath(z);
-  if (!z.path.length) return;
-  const pts = pathCorners(z.path);
-  for (const p of pts) {
-    const d = document.createElement("div");
-    d.className = "path-dot" + (p.id === state.selectedPathId ? " selected" : "");
-    d.style.left = `${(p.x + p.w / 2) * 100}%`;
-    d.style.top = `${(p.y + p.h / 2) * 100}%`;
-    d.title = fmtTime(p.t);
-    d.addEventListener("pointerdown", (ev) => {
-      ev.preventDefault();
-      ev.stopPropagation();
-      state.selectedPathId = p.id;
-      video.currentTime = p.t;
-      sync();
-    });
-    wrap.appendChild(d);
-  }
-}
-
-function pathCorners(path) {
-  if (path.length <= 2) return path.slice();
-  const out = [path[0]];
-  for (let i = 1; i < path.length - 1; i++) {
-    const a = out[out.length - 1];
-    const b = path[i];
-    const c = path[i + 1];
-    if (sameWindow(a, b) && sameWindow(b, c)) continue;
-    out.push(b);
-  }
-  out.push(path[path.length - 1]);
-  if (out.length > 24) {
-    const step = (out.length - 1) / 23;
-    const slim = [out[0]];
-    for (let i = 1; i < 23; i++) slim.push(out[Math.round(i * step)]);
-    slim.push(out[out.length - 1]);
-    return slim;
-  }
-  return out;
-}
 
 function renderList() {
   const ul = $("#zoom-list");
@@ -259,13 +200,34 @@ function renderList() {
     const li = document.createElement("li");
     if (z.id === state.selectedId) li.classList.add("selected");
     const mag = (1 / z.rect.w).toFixed(2);
-    const pan = z.path?.length ? ` · ${z.path.length} steps` : "";
     li.innerHTML = `<div class="t">${fmtTime(z.inStart)} – ${fmtTime(z.outEnd)}</div>
-      <div class="sub">${mag}×${pan} · in ${(z.inEnd - z.inStart).toFixed(2)}s · out ${(z.outEnd - z.outStart).toFixed(2)}s</div>`;
+      <div class="sub">${mag}× · transition ${(z.inEnd - z.inStart).toFixed(2)}s · out ${(z.outEnd - z.outStart).toFixed(2)}s</div>`;
     li.addEventListener("click", () => {
       state.selectedId = z.id;
-      state.selectedPathId = null;
+      state.selectedSpeedId = null;
       video.currentTime = z.inStart;
+      sync();
+    });
+    ul.appendChild(li);
+  }
+}
+
+function renderSpeedList() {
+  const ul = $("#speed-list");
+  ul.innerHTML = "";
+  if (!state.speeds.length) {
+    ul.innerHTML = `<li class="muted">No speed blocks</li>`;
+    return;
+  }
+  for (const s of [...state.speeds].sort((a, b) => a.start - b.start)) {
+    const li = document.createElement("li");
+    if (s.id === state.selectedSpeedId) li.classList.add("selected");
+    li.innerHTML = `<div class="t">${fmtTime(s.start)} – ${fmtTime(s.end)}</div>
+      <div class="sub">${s.factor}× speed</div>`;
+    li.addEventListener("click", () => {
+      state.selectedSpeedId = s.id;
+      state.selectedId = null;
+      video.currentTime = s.start;
       sync();
     });
     ul.appendChild(li);
@@ -274,22 +236,20 @@ function renderList() {
 
 function renderInspector() {
   const z = selected();
+  const sp = selectedSpeed();
+  $("#speed-inspector").classList.toggle("hidden", !sp);
+  if (sp) {
+    $("#sp-start").value = sp.start.toFixed(2);
+    $("#sp-end").value = sp.end.toFixed(2);
+    $("#sp-factor").value = sp.factor;
+  }
   const box = $("#inspector");
-  box.classList.toggle("hidden", !z);
-  if (!z) return;
+  box.classList.toggle("hidden", !z || !!sp);
+  if (!z || sp) return;
   $("#in-dur").value = (z.inEnd - z.inStart).toFixed(2);
   $("#hold-dur").value = Math.max(0, z.outStart - z.inEnd).toFixed(2);
   $("#out-dur").value = (z.outEnd - z.outStart).toFixed(2);
   $("#easing").value = z.easing || "easeInOutCubic";
-  normalizePath(z);
-  const panMeta = $("#pan-meta");
-  if (panMeta) {
-    if (state.drawing) panMeta.textContent = "drawing · hold still to stay, move to pan, resize if you want";
-    else if (z.path.length) panMeta.textContent = `${z.path.length} steps · ${fmtTime(z.path[0].t)} → ${fmtTime(z.path[z.path.length - 1].t)} · hold the window to draw`;
-    else panMeta.textContent = "hold the window while video plays to draw its path";
-  }
-  const delPan = $("#btn-delete-pan");
-  if (delPan) delPan.classList.toggle("hidden", z.path.length === 0);
 }
 
 function renderTimeline() {
@@ -312,61 +272,29 @@ function renderTimeline() {
   }
   const labels = $("#tl-labels");
   labels.innerHTML = `<span>0:00</span><span>${fmtTime(dur)}</span>`;
-  renderPanTrack();
+  renderSpeedTrack();
+  renderCropTrack();
   updatePlayhead();
 }
 
-function renderPanTrack() {
-  const keys = $("#pan-keys");
-  if (!keys) return;
-  keys.innerHTML = "";
-  const dur = duration();
-  const z = selected();
-  if (!dur || !z) return;
-  normalizePath(z);
-  const span = document.createElement("div");
-  span.className = "pan-span";
-  span.style.left = `${(z.inStart / dur) * 100}%`;
-  span.style.width = `${((z.outEnd - z.inStart) / dur) * 100}%`;
-  keys.appendChild(span);
-  if (z.path.length) {
-    const first = z.path[0];
-    const last = z.path[z.path.length - 1];
-    const seg = document.createElement("div");
-    seg.className = "pan-seg" + (state.drawing === z ? " selected" : "");
-    seg.style.left = `${(first.t / dur) * 100}%`;
-    seg.style.width = `${Math.max(0, last.t - first.t) / dur * 100}%`;
-    keys.appendChild(seg);
-    const left = document.createElement("div");
-    left.className = "tl-edge left";
-    const right = document.createElement("div");
-    right.className = "tl-edge right";
-    seg.append(left, right);
-    for (const p of pathCorners(z.path)) {
-      const tick = document.createElement("div");
-      tick.className = "pan-tick";
-      tick.style.left = `${(p.t / dur) * 100}%`;
-      tick.title = fmtTime(p.t);
-      keys.appendChild(tick);
-    }
-  }
-}
 
 function updatePlayhead() {
   const dur = duration();
   if (!dur) return;
   const pct = `${(video.currentTime / dur) * 100}%`;
   $("#playhead").style.left = pct;
-  const panHead = $("#playhead-pan");
-  if (panHead) panHead.style.left = pct;
+  const spHead = $("#playhead-speed");
+  if (spHead) spHead.style.left = pct;
+  const cropHead = $("#playhead-crop");
+  if (cropHead) cropHead.style.left = pct;
   $("#clock").textContent = fmtTime(video.currentTime);
 }
 
 function sync() {
   applyPreview();
   renderRect();
-  renderPathDots();
   renderList();
+  renderSpeedList();
   renderInspector();
   renderTimeline();
   $("#btn-play").textContent = video.paused ? "Play" : "Pause";
@@ -392,228 +320,216 @@ function clampZoom(z) {
     z.inEnd -= extra;
     z.outStart -= extra;
     z.outEnd = dur;
-    for (const p of z.path || []) p.t -= extra;
   }
-  const r = z.rect;
-  r.w = Math.min(1, Math.max(0.08, r.w));
-  r.h = r.w;
-  r.x = Math.min(1 - r.w, Math.max(0, r.x));
-  r.y = Math.min(1 - r.h, Math.max(0, r.y));
-  normalizePath(z);
-  for (const p of z.path) {
-    p.t = Math.min(z.outEnd, Math.max(z.inStart, p.t));
-    p.w = Math.min(1, Math.max(0.08, Number.isFinite(p.w) ? p.w : r.w));
-    p.h = p.w;
-    p.x = Math.min(1 - p.w, Math.max(0, p.x));
-    p.y = Math.min(1 - p.h, Math.max(0, p.y));
-  }
-  z.path.sort((a, b) => a.t - b.t);
+  clampRect(z.rect);
 }
 
 function addZoom() {
   if (!state.probe) return;
   const t = video.currentTime;
-  const inDur = 0.5;
-  const hold = 2;
-  const outDur = 0.5;
   const z = {
     id: uid(),
     inStart: t,
-    inEnd: t + inDur,
-    outStart: t + inDur + hold,
-    outEnd: t + inDur + hold + outDur,
+    inEnd: t + 0.5,
+    outStart: t + 2.5,
+    outEnd: t + 3,
     rect: { x: 0.25, y: 0.25, w: 0.5, h: 0.5 },
-    path: [],
     easing: "easeInOutCubic",
-    panEasing: "linear",
   };
   clampZoom(z);
   state.zooms.push(z);
   state.selectedId = z.id;
-  state.selectedPathId = null;
+  state.selectedSpeedId = null;
   markDirty();
   sync();
 }
 
-function panEnds(z) {
-  normalizePath(z);
-  if (!z.path.length) return null;
-  return { start: z.path[0], end: z.path[z.path.length - 1] };
-}
 
-function extendZoomTo(z, t) {
-  const dur = duration();
-  const outDur = Math.max(0.05, z.outEnd - z.outStart);
-  if (t > z.outEnd - 0.12) {
-    z.outEnd = Math.min(dur, t + 0.35);
-    z.outStart = Math.max(z.inEnd + 0.05, z.outEnd - outDur);
-  }
-}
-
-function startDraw(z) {
-  if (!z || !dragging) return;
-  const dur = duration();
-  let t = video.currentTime;
-  if (t < z.inStart) t = z.inStart;
-  if (t > z.outEnd - 0.08) t = Math.max(z.inStart, z.outEnd - 0.08);
-  if (Math.abs(video.currentTime - t) > 0.02) video.currentTime = t;
-  const live = dragging.live ? clampRect(dragging.live) : clampRect(copyRect(displayRect(z)));
-  dragging.live = live;
-  dragging.point = live;
-  dragging.moving = false;
-  dragging.lastMoveT = t;
-  dragging.lastSampleT = t;
-  normalizePath(z);
-  z.path = z.path.filter((p) => p.t < t - 0.001);
-  z.path.push({ id: uid(), t, x: live.x, y: live.y, w: live.w, h: live.h });
-  if (!z.path.length || t <= z.path[0].t) z.rect = copyRect(live);
-  z.panEasing = z.panEasing || "linear";
-  state.drawing = z;
-  state.selectedId = z.id;
-  dragging.kind = "draw";
-  markDirty();
-  sync();
-  if (video.paused && t < dur - 0.02) video.play().catch(() => {});
-}
-
-function recordWindow() {
-  const z = state.drawing;
-  if (!z || !dragging?.live) return;
-  const live = clampRect(dragging.live);
-  const t = video.currentTime;
-  extendZoomTo(z, t);
-  normalizePath(z);
-  let last = z.path[z.path.length - 1];
-  if (!last) {
-    z.path.push({ id: uid(), t, ...copyRect(live) });
-    dragging.lastMoveT = t;
-    dragging.lastSampleT = t;
-    return;
-  }
-  if (sameWindow(last, live)) return;
-  if (!dragging.moving) {
-    if (t - last.t > 0.05) {
-      z.path.push({
-        id: uid(),
-        t,
-        x: last.x,
-        y: last.y,
-        w: last.w,
-        h: last.h,
-      });
-    }
-    dragging.moving = true;
-    z.path.push({ id: uid(), t: t + 0.001, ...copyRect(live) });
-    dragging.lastMoveT = t;
-    dragging.lastSampleT = t;
-    return;
-  }
-  last = z.path[z.path.length - 1];
-  const dt = t - (dragging.lastSampleT ?? last.t);
-  if (dt >= SAMPLE_DT && windowDist(last, live) >= SAMPLE_DIST) {
-    z.path.push({ id: uid(), t, ...copyRect(live) });
-    dragging.lastSampleT = t;
-  }
-  dragging.lastMoveT = t;
-}
-
-function tickDraw() {
-  const z = state.drawing;
-  if (!z) return;
-  const t = video.currentTime;
-  const dur = duration();
-  extendZoomTo(z, t);
-  if (dragging?.moving && t - (dragging.lastMoveT ?? t) > 0.14) dragging.moving = false;
-  renderPanTrack();
-  renderInspector();
-  renderRect();
-  renderPathDots();
-  if (t >= dur - 0.02) stopDraw();
-}
-
-function stopDraw() {
-  const z = state.drawing;
-  if (!z) return;
-  const t = video.currentTime;
-  if (dragging?.live) {
-    const live = clampRect(dragging.live);
-    normalizePath(z);
-    const last = z.path[z.path.length - 1];
-    if (!last) {
-      z.path.push({ id: uid(), t, ...copyRect(live) });
-    } else if (sameWindow(last, live)) {
-      if (t - last.t > 0.08) z.path.push({ id: uid(), t, ...copyRect(live) });
-      else last.t = Math.max(last.t, t);
-    } else if (t - last.t >= 0.04) {
-      z.path.push({ id: uid(), t, ...copyRect(live) });
-    } else {
-      last.x = live.x;
-      last.y = live.y;
-      last.w = live.w;
-      last.h = live.h;
-      last.t = Math.max(last.t, t);
-    }
-  }
-  state.drawing = null;
-  simplifyPath(z);
-  clampZoom(z);
-  if (!video.paused) video.pause();
-  markDirty();
-  sync();
-}
-
-function commitPausedWindow(z, live) {
-  clampRect(live);
-  normalizePath(z);
-  if (!z.path.length) {
-    Object.assign(z.rect, copyRect(live));
-    return;
-  }
-  const t = video.currentTime;
-  if (t < z.path[0].t - 0.04) {
-    Object.assign(z.rect, copyRect(live));
-    return;
-  }
-  let best = z.path[0];
-  for (const p of z.path) {
-    if (Math.abs(p.t - t) < Math.abs(best.t - t)) best = p;
-  }
-  best.x = live.x;
-  best.y = live.y;
-  best.w = live.w;
-  best.h = live.h;
-}
-
-function clearHoldTimer() {
-  if (dragging?.holdTimer) {
-    clearTimeout(dragging.holdTimer);
-    dragging.holdTimer = null;
-  }
-}
-
-function pointerMoved(ev, from) {
-  const dx = ev.clientX - from.clientX;
-  const dy = ev.clientY - from.clientY;
-  return dx * dx + dy * dy > HOLD_MOVE_PX * HOLD_MOVE_PX;
-}
-
-function deleteSelectedPan() {
-  const z = selected();
-  if (!z || !z.path?.length) return false;
-  z.path = [];
-  state.selectedPathId = null;
+function deleteSelectedSpeed() {
+  const s = selectedSpeed();
+  if (!s) return false;
+  state.speeds = state.speeds.filter((x) => x.id !== s.id);
+  state.selectedSpeedId = null;
   markDirty();
   sync();
   return true;
 }
 
-function clearPans() {
-  const z = selected();
-  if (!z || !z.path?.length) return;
-  z.path = [];
-  state.selectedPathId = null;
+function applySpeedInspector() {
+  const s = selectedSpeed();
+  if (!s) return;
+  s.start = Number($("#sp-start").value);
+  s.end = Number($("#sp-end").value);
+  s.factor = Number($("#sp-factor").value);
+  clampSpeed(s);
   markDirty();
   sync();
+}
+
+function renderSpeedTrack() {
+  const keys = $("#speed-keys");
+  if (!keys) return;
+  keys.innerHTML = "";
+  const dur = duration();
+  if (!dur) return;
+  for (const s of [...state.speeds].sort((a, b) => a.start - b.start)) {
+    const el = document.createElement("div");
+    el.className = "tl-region speed" + (s.id === state.selectedSpeedId ? " selected" : "");
+    el.style.left = `${(s.start / dur) * 100}%`;
+    el.style.width = `${((s.end - s.start) / dur) * 100}%`;
+    el.dataset.id = s.id;
+    const left = document.createElement("div");
+    left.className = "tl-edge left";
+    const right = document.createElement("div");
+    right.className = "tl-edge right";
+    el.append(left, right);
+    keys.appendChild(el);
+  }
+}
+
+function renderCropTrack() {
+  const keys = $("#crop-keys");
+  if (!keys) return;
+  keys.innerHTML = "";
+  const dur = duration();
+  if (!dur) return;
+  const range = document.createElement("div");
+  range.className = "crop-range";
+  range.style.left = `${(state.cropStart / dur) * 100}%`;
+  range.style.width = `${((cropEndTime() - state.cropStart) / dur) * 100}%`;
+  range.innerHTML = `<span>${fmtTime(state.cropStart)} – ${fmtTime(cropEndTime())}</span>`;
+  const left = document.createElement("div");
+  left.className = "tl-edge left";
+  const right = document.createElement("div");
+  right.className = "tl-edge right";
+  range.append(left, right);
+  keys.appendChild(range);
+}
+
+function bindCropTrack() {
+  const track = $("#crop-track");
+  if (!track) return;
+  const tAt = (clientX, box, dur) => {
+    const t = ((clientX - box.left) / box.width) * dur;
+    return Math.min(dur, Math.max(0, t));
+  };
+  track.addEventListener("pointerdown", (ev) => {
+    const dur = duration();
+    if (!dur) return;
+    const box = track.getBoundingClientRect();
+    const edge = ev.target.classList.contains("tl-edge") ? ev.target : null;
+    if (edge) {
+      dragging = {
+        kind: edge.classList.contains("left") ? "cropL" : "cropR",
+        box,
+        dur,
+      };
+    } else {
+      video.currentTime = tAt(ev.clientX, box, dur);
+      dragging = { kind: "seek", box, dur };
+      updatePlayhead();
+      applyPreview();
+    }
+    track.setPointerCapture(ev.pointerId);
+  });
+  track.addEventListener("pointermove", (ev) => {
+    if (!dragging) return;
+    const dur = dragging.dur ?? duration();
+    const box = dragging.box ?? track.getBoundingClientRect();
+    const t = tAt(ev.clientX, box, dur);
+    if (dragging.kind === "seek") {
+      video.currentTime = t;
+      updatePlayhead();
+      applyPreview();
+      return;
+    }
+    if (dragging.kind === "cropL") {
+      state.cropStart = Math.min(cropEndTime() - 0.05, t);
+      video.currentTime = state.cropStart;
+    } else if (dragging.kind === "cropR") {
+      state.cropEnd = Math.max(state.cropStart + 0.05, t);
+      video.currentTime = state.cropEnd;
+    } else {
+      return;
+    }
+    clampCrop();
+    renderCropTrack();
+    updatePlayhead();
+  });
+}
+
+function bindSpeedTrack() {
+  const track = $("#speed-track");
+  if (!track) return;
+  const tAt = (clientX, box, dur) => {
+    const t = ((clientX - box.left) / box.width) * dur;
+    return Math.min(dur, Math.max(0, t));
+  };
+  track.addEventListener("pointerdown", (ev) => {
+    const dur = duration();
+    if (!dur) return;
+    const box = track.getBoundingClientRect();
+    const region = ev.target.closest(".tl-region.speed");
+    const edge = ev.target.classList.contains("tl-edge") ? ev.target : null;
+    if (region) {
+      const s = state.speeds.find((x) => x.id === region.dataset.id);
+      state.selectedSpeedId = s.id;
+      state.selectedId = null;
+      dragging = {
+        kind: edge ? (edge.classList.contains("left") ? "spL" : "spR") : "moveSp",
+        s,
+        orig: { start: s.start, end: s.end },
+        startX: ev.clientX,
+        box,
+        dur,
+      };
+      sync();
+    } else {
+      video.currentTime = tAt(ev.clientX, box, dur);
+      dragging = { kind: "seek", box, dur };
+      updatePlayhead();
+      applyPreview();
+      renderRect();
+    }
+    track.setPointerCapture(ev.pointerId);
+  });
+  track.addEventListener("pointermove", (ev) => {
+    if (!dragging) return;
+    const dur = dragging.dur ?? duration();
+    const box = dragging.box ?? track.getBoundingClientRect();
+    if (dragging.kind === "seek") {
+      video.currentTime = tAt(ev.clientX, box, dur);
+      updatePlayhead();
+      applyPreview();
+      renderRect();
+      return;
+    }
+    if (!dragging.s || !["spL", "spR", "moveSp"].includes(dragging.kind)) return;
+    const dt = ((ev.clientX - dragging.startX) / box.width) * dur;
+    const s = dragging.s;
+    const o = dragging.orig;
+    if (dragging.kind === "moveSp") {
+      const span = o.end - o.start;
+      s.start = o.start + dt;
+      s.end = o.end + dt;
+      if (s.start < 0) {
+        s.start = 0;
+        s.end = span;
+      }
+      if (s.end > dur) {
+        s.end = dur;
+        s.start = dur - span;
+      }
+    } else if (dragging.kind === "spL") {
+      s.start = Math.min(o.end - 0.1, Math.max(0, o.start + dt));
+    } else {
+      s.end = Math.max(o.start + 0.1, Math.min(dur, o.end + dt));
+    }
+    clampSpeed(s);
+    renderSpeedTrack();
+    renderSpeedList();
+    renderInspector();
+  });
 }
 
 function applyInspector() {
@@ -623,7 +539,6 @@ function applyInspector() {
   const hold = Number($("#hold-dur").value);
   const outDur = Number($("#out-dur").value);
   z.easing = $("#easing").value;
-  z.panEasing = z.panEasing || "linear";
   z.inEnd = z.inStart + inDur;
   z.outStart = z.inEnd + hold;
   z.outEnd = z.outStart + outDur;
@@ -646,21 +561,14 @@ function bindOverlay() {
     if (!z || ev.button !== 0) return;
     ev.preventDefault();
     ev.stopPropagation();
-    const handle = ev.target.dataset.handle || "move";
     const live = clampRect(copyRect(displayRect(z)));
     dragging = {
-      kind: "rectPending",
-      handle,
+      kind: "rect",
+      handle: ev.target.dataset.handle || "move",
       start: toNorm(ev),
       orig: copyRect(live),
       live,
       point: live,
-      clientX: ev.clientX,
-      clientY: ev.clientY,
-      holdTimer: setTimeout(() => {
-        if (dragging?.kind !== "rectPending") return;
-        startDraw(z);
-      }, HOLD_MS),
     };
     rectEl.setPointerCapture(ev.pointerId);
   });
@@ -711,41 +619,19 @@ function applyRectDrag(ev, z) {
 }
 
 function onPointerMove(ev) {
-  if (!dragging) return;
-
-  if (dragging.kind === "rectPending") {
-    if (!pointerMoved(ev, dragging)) return;
-    clearHoldTimer();
-    dragging.kind = "rect";
-  }
-
+  if (!dragging || dragging.kind !== "rect") return;
   const z = selected();
   if (!z) return;
-
-  if (dragging.kind === "draw") {
-    applyRectDrag(ev, z);
-    recordWindow();
-    renderRect();
-    renderPanTrack();
-    renderPathDots();
-    return;
-  }
-
-  if (dragging.kind !== "rect") return;
   applyRectDrag(ev, z);
-  commitPausedWindow(z, dragging.live);
+  Object.assign(z.rect, dragging.live);
   renderRect();
   renderList();
-  renderPathDots();
-  renderPanTrack();
 }
 
 function onPointerUp(ev) {
   if (ev && ev.button && ev.button !== 0) return;
-  clearHoldTimer();
-  if (dragging?.kind === "draw" || state.drawing) stopDraw();
-  else if (dragging?.kind === "rect" && selected() && dragging.live) {
-    commitPausedWindow(selected(), dragging.live);
+  if (dragging?.kind === "rect" && selected() && dragging.live) {
+    Object.assign(selected().rect, dragging.live);
     clampZoom(selected());
   }
   if (dragging && dragging.kind !== "seek") markDirty();
@@ -755,7 +641,6 @@ function onPointerUp(ev) {
 function bindTimeline() {
   const track = $("#tl-track");
   track.addEventListener("pointerdown", (ev) => {
-    if (state.drawing) return;
     const dur = duration();
     if (!dur) return;
     const region = ev.target.closest(".tl-region");
@@ -769,14 +654,11 @@ function bindTimeline() {
     if (region) {
       const z = state.zooms.find((x) => x.id === region.dataset.id);
       state.selectedId = z.id;
-      state.selectedPathId = null;
-      normalizePath(z);
       const orig = {
         inStart: z.inStart,
         inEnd: z.inEnd,
         outStart: z.outStart,
         outEnd: z.outEnd,
-        path: z.path.map((p) => p.t),
       };
       dragging = {
         kind: edge ? (edge.classList.contains("left") ? "edgeL" : "edgeR") : "moveZ",
@@ -810,7 +692,6 @@ function bindTimeline() {
       updatePlayhead();
       applyPreview();
       renderRect();
-      renderPathDots();
       return;
     }
     if (!dragging.z) return;
@@ -836,11 +717,6 @@ function bindTimeline() {
         z.outStart -= shift;
         z.outEnd = dur;
       }
-      const pathShift = z.inStart - o.inStart;
-      normalizePath(z);
-      for (let i = 0; i < z.path.length; i++) {
-        z.path[i].t = (o.path[i] ?? z.path[i].t) + pathShift;
-      }
     } else if (dragging.kind === "edgeL") {
       z.inStart = Math.min(o.outStart - 0.2, Math.max(0, o.inStart + dt));
       const inDur = o.inEnd - o.inStart;
@@ -857,102 +733,19 @@ function bindTimeline() {
     renderList();
     renderInspector();
     renderRect();
-    renderPathDots();
   });
 }
 
-function bindPanTrack() {
-  const track = $("#pan-track");
-  if (!track) return;
-  const tAt = (ev, box, dur) => {
-    const t = ((ev.clientX - box.left) / box.width) * dur;
-    return Math.min(dur, Math.max(0, t));
-  };
-  track.addEventListener("pointerdown", (ev) => {
-    if (state.drawing) return;
-    const dur = duration();
-    if (!dur) return;
-    const box = track.getBoundingClientRect();
-    const seg = ev.target.closest(".pan-seg");
-    const edge = ev.target.classList.contains("tl-edge") ? ev.target : null;
-    const z = selected();
-    if (seg && z) {
-      const ends = panEnds(z);
-      if (!ends) return;
-      dragging = {
-        kind: edge ? (edge.classList.contains("left") ? "panL" : "panR") : "movePan",
-        z,
-        orig: {
-          start: ends.start.t,
-          end: ends.end.t,
-          times: z.path.map((p) => p.t),
-        },
-        startX: ev.clientX,
-        box,
-        dur,
-      };
-      track.setPointerCapture(ev.pointerId);
-      return;
-    }
-    video.currentTime = tAt(ev, box, dur);
-    dragging = { kind: "seek", box, dur };
-    track.setPointerCapture(ev.pointerId);
-    updatePlayhead();
-    applyPreview();
-    renderRect();
-    renderPathDots();
-  });
-  track.addEventListener("pointermove", (ev) => {
-    if (!dragging) return;
-    const dur = dragging.dur ?? duration();
-    const box = dragging.box ?? track.getBoundingClientRect();
-    if (dragging.kind === "seek") {
-      video.currentTime = tAt(ev, box, dur);
-      updatePlayhead();
-      applyPreview();
-      renderRect();
-      renderPathDots();
-      return;
-    }
-    if (!dragging.z || !["panL", "panR", "movePan"].includes(dragging.kind)) return;
-    const dt = ((ev.clientX - dragging.startX) / box.width) * dur;
-    const z = dragging.z;
-    const ends = panEnds(z);
-    if (!ends) return;
-    const o = dragging.orig;
-    const span = o.end - o.start;
-    let s = o.start;
-    let e = o.end;
-    if (dragging.kind === "movePan") {
-      s = o.start + dt;
-      e = o.end + dt;
-      if (s < z.inStart) {
-        s = z.inStart;
-        e = s + span;
-      }
-      if (e > z.outEnd) {
-        e = z.outEnd;
-        s = e - span;
-      }
-    } else if (dragging.kind === "panL") {
-      s = Math.min(o.end - 0.05, Math.max(z.inStart, o.start + dt));
-    } else if (dragging.kind === "panR") {
-      e = Math.max(o.start + 0.05, Math.min(z.outEnd, o.end + dt));
-    }
-    for (let i = 0; i < z.path.length; i++) {
-      const u = (o.times[i] - o.start) / Math.max(span, 0.0001);
-      z.path[i].t = s + u * (e - s);
-    }
-    renderPanTrack();
-    renderInspector();
-    renderRect();
-  });
-}
 
 function tick() {
   updatePlayhead();
-  if (state.drawing) tickDraw();
   applyPreview();
+  if (video.currentTime >= cropEndTime() - 0.01) {
+    video.pause();
+    video.currentTime = cropEndTime();
+    updatePlayhead();
+    return;
+  }
   if (!video.paused) requestAnimationFrame(tick);
 }
 
@@ -973,18 +766,26 @@ async function api(url, opts) {
 
 async function openPath(path) {
   const probe = await api(`/api/probe?path=${encodeURIComponent(path)}`);
-  let project = { zooms: [] };
+  let project = { zooms: [], speeds: [] };
   try {
     project = await api(`/api/project?path=${encodeURIComponent(path)}`);
   } catch {}
   state.path = probe.path;
   state.probe = probe;
   state.zooms = Array.isArray(project.zooms) ? project.zooms : [];
-  for (const z of state.zooms) normalizePath(z);
+  state.speeds = Array.isArray(project.speeds) ? project.speeds : [];
+  state.cropStart = Number.isFinite(project.cropStart) ? project.cropStart : 0;
+  state.cropEnd = Number.isFinite(project.cropEnd) && project.cropEnd > 0 ? project.cropEnd : probe.duration;
+  clampCrop();
+  for (const s of state.speeds) {
+    if (!Number.isFinite(s.start)) s.start = 0;
+    clampSpeed(s);
+  }
   state.selectedId = state.zooms[0]?.id ?? null;
-  state.selectedPathId = null;
+  state.selectedSpeedId = null;
   state.dirty = false;
   video.src = `/media?path=${encodeURIComponent(probe.path)}`;
+  video.currentTime = state.cropStart;
   $("#empty").classList.add("hidden");
   viewport.classList.remove("hidden");
   $("#file-label").textContent = probe.path;
@@ -992,6 +793,7 @@ async function openPath(path) {
   $("#btn-save").disabled = false;
   $("#btn-export").disabled = false;
   $("#btn-add").disabled = false;
+  $("#btn-add-speed").disabled = false;
   $("#btn-play").disabled = false;
   layoutViewport();
   sync();
@@ -1002,7 +804,13 @@ async function saveProject() {
   const r = await api("/api/project", {
     method: "PUT",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ source: state.path, zooms: state.zooms }),
+    body: JSON.stringify({
+      source: state.path,
+      zooms: state.zooms,
+      speeds: state.speeds,
+      cropStart: state.cropStart,
+      cropEnd: cropEndTime(),
+    }),
   });
   state.dirty = false;
   $("#file-label").textContent = state.path + " · saved";
@@ -1068,6 +876,9 @@ async function runExport() {
         source: state.path,
         output,
         zooms: state.zooms,
+        speeds: state.speeds,
+        cropStart: state.cropStart,
+        cropEnd: cropEndTime(),
       }),
     });
     if (!res.ok && !res.body) {
@@ -1120,41 +931,40 @@ function bindKeys() {
       togglePlay();
     } else if (ev.key === "n" || ev.key === "N") {
       addZoom();
+    } else if (ev.key === "f" || ev.key === "F") {
+      addSpeed();
     } else if (ev.key === "Delete" || ev.key === "Backspace") {
-      if (deleteSelectedPan()) return;
+      if (deleteSelectedSpeed()) return;
       const z = selected();
       if (!z) return;
       state.zooms = state.zooms.filter((x) => x.id !== z.id);
       state.selectedId = null;
-      state.selectedPathId = null;
       markDirty();
       sync();
     } else if (ev.key === "ArrowLeft") {
       ev.preventDefault();
-      video.currentTime = Math.max(0, video.currentTime - (ev.shiftKey ? 5 : 1));
+      video.currentTime = Math.max(state.cropStart, video.currentTime - (ev.shiftKey ? 5 : 1));
       updatePlayhead();
       applyPreview();
       renderRect();
-      renderPathDots();
     } else if (ev.key === "ArrowRight") {
       ev.preventDefault();
-      video.currentTime = Math.min(duration(), video.currentTime + (ev.shiftKey ? 5 : 1));
+      video.currentTime = Math.min(cropEndTime(), video.currentTime + (ev.shiftKey ? 5 : 1));
       updatePlayhead();
       applyPreview();
       renderRect();
-      renderPathDots();
     }
   });
 }
 
 function togglePlay() {
   if (!state.probe) return;
-  if (state.drawing) {
-    stopDraw();
-    return;
+  if (video.paused) {
+    if (video.currentTime < state.cropStart || video.currentTime >= cropEndTime()) video.currentTime = state.cropStart;
+    video.play();
+  } else {
+    video.pause();
   }
-  if (video.paused) video.play();
-  else video.pause();
 }
 
 async function main() {
@@ -1181,18 +991,21 @@ async function main() {
   });
 
   $("#btn-add").addEventListener("click", addZoom);
-  $("#btn-delete-pan").addEventListener("click", () => clearPans());
+  $("#btn-add-speed").addEventListener("click", addSpeed);
+  $("#btn-delete-speed").addEventListener("click", () => { deleteSelectedSpeed(); });
   $("#btn-delete").addEventListener("click", () => {
     const z = selected();
     if (!z) return;
     state.zooms = state.zooms.filter((x) => x.id !== z.id);
     state.selectedId = null;
-    state.selectedPathId = null;
     markDirty();
     sync();
   });
   ["in-dur", "hold-dur", "out-dur", "easing"].forEach((id) => {
     $(`#${id}`).addEventListener("change", applyInspector);
+  });
+  ["sp-start", "sp-end", "sp-factor"].forEach((id) => {
+    $(`#${id}`).addEventListener("change", applySpeedInspector);
   });
   $("#btn-save").addEventListener("click", () => saveProject().catch((e) => alert(e.message)));
   $("#btn-export").addEventListener("click", () => {
@@ -1207,33 +1020,27 @@ async function main() {
 
   video.addEventListener("play", () => {
     renderRect();
-    renderPathDots();
     requestAnimationFrame(tick);
     $("#btn-play").textContent = "Pause";
   });
   video.addEventListener("pause", () => {
-    if (state.drawing) stopDraw();
     $("#btn-play").textContent = "Play";
     applyPreview();
     renderRect();
-    renderPathDots();
   });
   video.addEventListener("timeupdate", () => {
     if (video.paused) {
       updatePlayhead();
       applyPreview();
       renderRect();
-      renderPathDots();
     }
   });
-  video.addEventListener("click", () => {
-    if (state.drawing) return;
-    togglePlay();
-  });
+  video.addEventListener("click", togglePlay);
 
   bindOverlay();
   bindTimeline();
-  bindPanTrack();
+  bindSpeedTrack();
+  bindCropTrack();
   bindKeys();
   window.addEventListener("pointermove", onPointerMove);
   window.addEventListener("pointerup", onPointerUp);

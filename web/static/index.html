@@ -27,7 +27,6 @@
         </div>
         <div class="viewport hidden" id="viewport">
           <video id="video" playsinline></video>
-          <div id="path-dots"></div>
           <div id="rect" class="rect hidden">
             <div class="handle nw" data-handle="nw"></div>
             <div class="handle ne" data-handle="ne"></div>
@@ -43,8 +42,13 @@
           <button type="button" id="btn-add" class="btn" disabled>Add at playhead</button>
         </div>
         <ul id="zoom-list" class="zoom-list"></ul>
+        <div class="side-head">
+          <span>Speed</span>
+          <button type="button" id="btn-add-speed" class="btn" disabled>Add 2× block</button>
+        </div>
+        <ul id="speed-list" class="zoom-list speed-list"></ul>
         <div id="inspector" class="inspector hidden">
-          <label>Zoom in
+          <label>Transition
             <input id="in-dur" type="number" min="0.05" max="4" step="0.05">
             <span>s</span>
           </label>
@@ -64,11 +68,22 @@
               <option value="linear">linear</option>
             </select>
           </label>
-          <div class="pan-box">
-            <div id="pan-meta" class="pan-meta"></div>
-            <button type="button" id="btn-delete-pan" class="btn hidden">Remove pan</button>
-          </div>
           <button type="button" id="btn-delete" class="btn danger">Delete zoom</button>
+        </div>
+        <div id="speed-inspector" class="inspector hidden">
+          <label>Start
+            <input id="sp-start" type="number" min="0" step="0.05">
+            <span>s</span>
+          </label>
+          <label>End
+            <input id="sp-end" type="number" min="0" step="0.05">
+            <span>s</span>
+          </label>
+          <label>Factor
+            <input id="sp-factor" type="number" min="0.25" max="4" step="0.25">
+            <span>×</span>
+          </label>
+          <button type="button" id="btn-delete-speed" class="btn danger">Delete block</button>
         </div>
       </aside>
 
@@ -78,7 +93,7 @@
           <span id="clock" class="clock">0:00.00</span>
           <span class="muted" id="clock-dur">/ 0:00.00</span>
           <span class="spacer"></span>
-          <span class="hint">add a window · hold it to draw the path · stay still to hold · space play</span>
+          <span class="hint">n add zoom · f add 2× block · zoom points pan automatically · space play</span>
         </div>
         <div class="timeline" id="timeline">
           <div class="tl-lane">
@@ -89,10 +104,17 @@
             </div>
           </div>
           <div class="tl-lane">
-            <span class="tl-lane-label">pan</span>
-            <div class="tl-track pan" id="pan-track" title="Hold the zoom window to draw its path">
-              <div id="pan-keys"></div>
-              <div id="playhead-pan" class="playhead"></div>
+            <span class="tl-lane-label">speed</span>
+            <div class="tl-track compact" id="speed-track" title="Blocks where playback runs faster">
+              <div id="speed-keys"></div>
+              <div id="playhead-speed" class="playhead"></div>
+            </div>
+          </div>
+          <div class="tl-lane">
+            <span class="tl-lane-label">crop</span>
+            <div class="tl-track compact" id="crop-track" title="Drag the handles to set export start and end">
+              <div id="crop-keys"></div>
+              <div id="playhead-crop" class="playhead"></div>
             </div>
           </div>
           <div class="tl-labels-row">

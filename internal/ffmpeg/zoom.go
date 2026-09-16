@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"math"
 	"sort"
+	"strconv"
 	"strings"
 )
 
@@ -14,6 +15,8 @@ type Rect struct {
 	H float64 `json:"h"`
 }
 
+// PathPoint and the path fields on Zoom remain for old sidecar compatibility.
+// Automatic camera movement ignores them.
 type PathPoint struct {
 	ID string  `json:"id,omitempty"`
 	T  float64 `json:"t"`
@@ -108,92 +111,57 @@ func ease(p float64, kind string) float64 {
 	}
 }
 
-func panEaseKind(z Zoom) string {
-	if strings.TrimSpace(z.PanEasing) != "" {
-		return z.PanEasing
+func lerpRect(a, b Rect, p float64) Rect {
+	return Rect{
+		X: lerp(a.X, b.X, p),
+		Y: lerp(a.Y, b.Y, p),
+		W: lerp(a.W, b.W, p),
+		H: lerp(a.H, b.H, p),
 	}
-	if strings.TrimSpace(z.Easing) != "" {
-		return z.Easing
-	}
-	return "easeInOutCubic"
 }
 
-func amountFor(z Zoom, t float64) float64 {
-	if t <= z.InStart || t >= z.OutEnd {
-		return 0
+func cameraRectAt(zooms []Zoom, t float64) Rect {
+	full := Rect{W: 1, H: 1}
+	zs := make([]Zoom, 0, len(zooms))
+	for _, z := range zooms {
+		if z.valid() {
+			zs = append(zs, z)
+		}
+	}
+	if len(zs) == 0 {
+		return full
+	}
+	sort.SliceStable(zs, func(i, j int) bool { return zs[i].InStart < zs[j].InStart })
+
+	i := -1
+	for n := range zs {
+		if t < zs[n].InStart {
+			break
+		}
+		i = n
+	}
+	if i < 0 {
+		return full
+	}
+
+	z := zs[i]
+	from := full
+	if i > 0 {
+		from = zs[i-1].Rect
 	}
 	if t < z.InEnd {
 		d := math.Max(z.InEnd-z.InStart, 0.0001)
-		return ease((t-z.InStart)/d, z.Easing)
+		return lerpRect(from, z.Rect, ease((t-z.InStart)/d, z.Easing))
 	}
-	if t <= z.OutStart {
-		return 1
-	}
-	d := math.Max(z.OutEnd-z.OutStart, 0.0001)
-	return 1 - ease((t-z.OutStart)/d, z.Easing)
-}
-
-func pathPoints(z Zoom) []PathPoint {
-	if len(z.Path) == 0 {
-		return nil
-	}
-	pts := append([]PathPoint(nil), z.Path...)
-	sort.Slice(pts, func(i, j int) bool { return pts[i].T < pts[j].T })
-	return pts
-}
-
-func rectAt(z Zoom, t float64) Rect {
-	pts := pathPoints(z)
-	if len(pts) == 0 {
-		return z.Rect
-	}
-	first := pts[0]
-	if t < first.T {
-		return z.Rect
-	}
-	if t <= first.T || len(pts) == 1 {
-		return Rect{X: first.X, Y: first.Y, W: first.W, H: first.H}
-	}
-	last := pts[len(pts)-1]
-	if t >= last.T {
-		return Rect{X: last.X, Y: last.Y, W: last.W, H: last.H}
-	}
-	for i := 1; i < len(pts); i++ {
-		if t > pts[i].T {
-			continue
-		}
-		a, b := pts[i-1], pts[i]
-		d := math.Max(b.T-a.T, 0.0001)
-		p := ease((t-a.T)/d, panEaseKind(z))
-		return Rect{
-			X: lerp(a.X, b.X, p),
-			Y: lerp(a.Y, b.Y, p),
-			W: lerp(a.W, b.W, p),
-			H: lerp(a.H, b.H, p),
-		}
+	if i == len(zs)-1 && t > z.OutStart {
+		d := math.Max(z.OutEnd-z.OutStart, 0.0001)
+		return lerpRect(z.Rect, full, ease((t-z.OutStart)/d, z.Easing))
 	}
 	return z.Rect
 }
 
 func CropAt(zooms []Zoom, t float64, w, h int) (x, y, cw, ch int) {
-	for _, z := range zooms {
-		if !z.valid() {
-			continue
-		}
-		a := amountFor(z, t)
-		if a <= 0 {
-			continue
-		}
-		target := rectAt(z, t)
-		r := Rect{
-			X: lerp(0, target.X, a),
-			Y: lerp(0, target.Y, a),
-			W: lerp(1, target.W, a),
-			H: lerp(1, target.H, a),
-		}
-		return r.pixels(w, h)
-	}
-	return 0, 0, even(w), even(h)
+	return cameraRectAt(zooms, t).pixels(w, h)
 }
 
 func HasZooms(zooms []Zoom) bool {
@@ -206,7 +174,9 @@ func HasZooms(zooms []Zoom) bool {
 }
 
 func BuildSendCmd(zooms []Zoom, w, h int, fps, duration float64) string {
-	fps = snapFPS(fps)
+	if fps <= 0 {
+		fps = 60
+	}
 	if duration <= 0 {
 		duration = 0
 		for _, z := range zooms {
@@ -224,7 +194,7 @@ func BuildSendCmd(zooms []Zoom, w, h int, fps, duration float64) string {
 			return
 		}
 		prevW, prevH, prevX, prevY = cw, ch, x, y
-		fmt.Fprintf(&b, "%.4f crop@z w %d, crop@z h %d, crop@z x %d, crop@z y %d;\n", t, cw, ch, x, y)
+		fmt.Fprintf(&b, "%.6f crop@z w %d, crop@z h %d, crop@z x %d, crop@z y %d;\n", t, cw, ch, x, y)
 	}
 	emit(0)
 	for t := dt; t <= duration+dt/2; t += dt {
@@ -233,13 +203,131 @@ func BuildSendCmd(zooms []Zoom, w, h int, fps, duration float64) string {
 	return b.String()
 }
 
-func BuildVideoFilter(cmdPath string, w, h int, fps float64) string {
+func BuildVideoFilter(cmdPath string, w, h int) string {
 	p := strings.ReplaceAll(cmdPath, `\`, `\\`)
 	p = strings.ReplaceAll(p, `'`, `\'`)
 	p = strings.ReplaceAll(p, `:`, `\:`)
-	rate := formatFPS(fps)
 	return fmt.Sprintf(
-		"fps=fps=%s,format=yuv444p,sendcmd=f='%s',crop@z=w=%d:h=%d:x=0:y=0:exact=1,scale=%d:%d:flags=lanczos+accurate_rnd+full_chroma_int,format=yuv420p,setsar=1",
-		rate, p, w, h, w, h,
+		"settb=AVTB,setpts=PTS-STARTPTS,format=yuv444p,sendcmd=f='%s',crop@z=w=%d:h=%d:x=0:y=0:exact=1,scale=%d:%d:flags=lanczos+accurate_rnd+full_chroma_int,format=yuv420p,setsar=1",
+		p, w, h, w, h,
 	)
+}
+
+type Speedup struct {
+	ID     string  `json:"id"`
+	Start  float64 `json:"start"`
+	End    float64 `json:"end"`
+	Factor float64 `json:"factor,omitempty"`
+}
+
+func (s Speedup) valid() bool {
+	return s.End > s.Start && s.Factor >= 0.25 && s.Factor <= 4 && s.Factor != 1
+}
+
+func HasSpeedups(ss []Speedup) bool {
+	for _, s := range ss {
+		if s.valid() {
+			return true
+		}
+	}
+	return false
+}
+
+// BuildSetpts returns a setpts filter that compresses each speedup block on
+// the source timeline. ponytail: overlapping blocks stack; the UI clamps
+// instead of resolving overlaps here.
+func BuildSetpts(ss []Speedup) string {
+	terms := make([]string, 0, len(ss))
+	for _, s := range ss {
+		if !s.valid() {
+			continue
+		}
+		k := 1 - 1/s.Factor
+		terms = append(terms, fmt.Sprintf(
+			"if(lt(T\\,%.4f)\\,0\\,(min(T\\,%.4f)-%.4f)*%.6f/TB)",
+			s.Start, s.End, s.Start, k))
+	}
+	if len(terms) == 0 {
+		return ""
+	}
+	return "setpts=PTS-" + strings.Join(terms, "-")
+}
+
+// OutputDuration is how long the exported video runs after speeding up blocks.
+func OutputDuration(dur float64, ss []Speedup) float64 {
+	out := dur
+	for _, s := range ss {
+		if s.valid() {
+			out -= (s.End - s.Start) * (1 - 1/s.Factor)
+		}
+	}
+	return math.Max(0, out)
+}
+
+func atempoChain(f float64) string {
+	out := ""
+	for f > 2 {
+		out += "atempo=2,"
+		f /= 2
+	}
+	for f < 0.5 {
+		out += "atempo=0.5,"
+		f *= 2
+	}
+	return out + "atempo=" + strconv.FormatFloat(f, 'f', -1, 64)
+}
+
+// BuildAtempo splits audio at speedup boundaries, respeeds each part and
+// rejoins it, so audio stays in sync with the compressed video.
+func BuildAtempo(ss []Speedup, duration float64) string {
+	bounds := []float64{0, duration}
+	for _, s := range ss {
+		if s.valid() {
+			bounds = append(bounds, s.Start, s.End)
+		}
+	}
+	sort.Float64s(bounds)
+	uniq := bounds[:0]
+	for i, b := range bounds {
+		if i == 0 || b > uniq[len(uniq)-1] {
+			uniq = append(uniq, b)
+		}
+	}
+	bounds = uniq
+	n := len(bounds) - 1
+	if n < 1 {
+		return ""
+	}
+	if n == 1 {
+		for _, s := range ss {
+			if s.valid() && s.Start <= 0.001 && s.End >= duration-0.001 {
+				return "asetpts=PTS-STARTPTS," + atempoChain(s.Factor)
+			}
+		}
+		return "asetpts=PTS-STARTPTS"
+	}
+	parts := make([]string, 0, n+2)
+	split := fmt.Sprintf("asetpts=PTS-STARTPTS,asplit=%d", n)
+	for i := 0; i < n; i++ {
+		split += fmt.Sprintf("[s%d]", i)
+	}
+	parts = append(parts, split)
+	ins := make([]string, 0, n)
+	for i := 0; i < n; i++ {
+		a, b := bounds[i], bounds[i+1]
+		f := 1.0
+		for _, s := range ss {
+			if s.valid() && s.Start <= a+0.001 && s.End >= b-0.001 {
+				f = s.Factor
+			}
+		}
+		seg := fmt.Sprintf("atrim=start=%.3f:end=%.3f,asetpts=PTS-STARTPTS", a, b)
+		if f != 1 {
+			seg += "," + atempoChain(f)
+		}
+		ins = append(ins, fmt.Sprintf("[a%d]", i))
+		parts = append(parts, fmt.Sprintf("[s%d]%s[a%d]", i, seg, i))
+	}
+	parts = append(parts, fmt.Sprintf("%sconcat=n=%d:v=0:a=1", strings.Join(ins, ""), n))
+	return strings.Join(parts, ";")
 }

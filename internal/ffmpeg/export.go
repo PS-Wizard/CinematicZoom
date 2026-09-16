@@ -42,6 +42,7 @@ func DetectEncoder() Encoder {
 			Args: []string{
 				"-c:v", "h264_amf",
 				"-quality", "quality",
+				"-bf", "0",
 				"-pix_fmt", "yuv420p",
 			},
 		}
@@ -63,11 +64,47 @@ func DetectEncoder() Encoder {
 type ProgressFunc func(ratio float64, timeSec float64, line string)
 
 type ExportOpts struct {
-	Source  string
-	Output  string
-	Probe   *Probe
-	Zooms   []Zoom
-	Encoder Encoder
+	Source    string
+	Output    string
+	Probe     *Probe
+	Zooms     []Zoom
+	Speedups  []Speedup
+	CropStart float64
+	CropEnd   float64
+	Encoder   Encoder
+}
+
+func cropRange(duration, start, end float64) (float64, float64, bool) {
+	if start < 0 || start >= duration {
+		start = 0
+	}
+	if end <= start || end > duration {
+		end = duration
+	}
+	return start, end, start > 0.0001 || end < duration-0.0001
+}
+
+func shiftZooms(zooms []Zoom, start float64) []Zoom {
+	out := append([]Zoom(nil), zooms...)
+	for i := range out {
+		out[i].InStart -= start
+		out[i].InEnd -= start
+		out[i].OutStart -= start
+		out[i].OutEnd -= start
+	}
+	return out
+}
+
+func clipSpeedups(speedups []Speedup, start, end float64) []Speedup {
+	out := make([]Speedup, 0, len(speedups))
+	for _, s := range speedups {
+		s.Start = clamp(s.Start, start, end) - start
+		s.End = clamp(s.End, start, end) - start
+		if s.valid() {
+			out = append(out, s)
+		}
+	}
+	return out
 }
 
 func Export(ctx context.Context, opts ExportOpts, progress ProgressFunc) error {
@@ -77,39 +114,58 @@ func Export(ctx context.Context, opts ExportOpts, progress ProgressFunc) error {
 	if opts.Encoder.Name == "" {
 		opts.Encoder = DetectEncoder()
 	}
+	cropStart, cropEnd, trim := cropRange(opts.Probe.Duration, opts.CropStart, opts.CropEnd)
+	windowDuration := cropEnd - cropStart
+	zooms := shiftZooms(opts.Zooms, cropStart)
+	speedups := clipSpeedups(opts.Speedups, cropStart, cropEnd)
 
 	args := []string{
 		"-hide_banner",
 		"-y",
 		"-progress", "pipe:1",
 		"-nostats",
-		"-i", opts.Source,
 	}
+	if trim {
+		args = append(args, "-ss", strconv.FormatFloat(cropStart, 'f', 6, 64), "-t", strconv.FormatFloat(windowDuration, 'f', 6, 64))
+	}
+	args = append(args, "-i", opts.Source)
 
-	if !HasZooms(opts.Zooms) {
+	speed := HasSpeedups(speedups)
+	if !HasZooms(zooms) && !speed && !trim {
 		args = append(args, "-c", "copy", "-avoid_negative_ts", "make_zero")
 	} else {
-		fps := snapFPS(opts.Probe.FPS)
-		cmdFile, err := os.CreateTemp("", "cinematic-*.cmd")
-		if err != nil {
-			return fmt.Errorf("sendcmd file: %w", err)
+		fps := opts.Probe.FPS
+		if opts.Probe.PeakFPS > fps {
+			fps = opts.Probe.PeakFPS
 		}
-		defer os.Remove(cmdFile.Name())
-		if _, err := cmdFile.WriteString(BuildSendCmd(opts.Zooms, opts.Probe.Width, opts.Probe.Height, fps, opts.Probe.Duration)); err != nil {
-			cmdFile.Close()
-			return fmt.Errorf("sendcmd write: %w", err)
+		var filter string
+		if HasZooms(zooms) {
+			cmdFile, err := os.CreateTemp("", "cinematic-*.cmd")
+			if err != nil {
+				return fmt.Errorf("sendcmd file: %w", err)
+			}
+			defer os.Remove(cmdFile.Name())
+			if _, err := cmdFile.WriteString(BuildSendCmd(zooms, opts.Probe.Width, opts.Probe.Height, fps, windowDuration)); err != nil {
+				cmdFile.Close()
+				return fmt.Errorf("sendcmd write: %w", err)
+			}
+			if err := cmdFile.Close(); err != nil {
+				return err
+			}
+			filter = BuildVideoFilter(cmdFile.Name(), opts.Probe.Width, opts.Probe.Height)
+		} else {
+			filter = "settb=AVTB,setpts=PTS-STARTPTS,format=yuv420p,setsar=1"
 		}
-		if err := cmdFile.Close(); err != nil {
-			return err
+		if speed {
+			filter += "," + BuildSetpts(speedups)
 		}
-		filter := BuildVideoFilter(cmdFile.Name(), opts.Probe.Width, opts.Probe.Height, fps)
-		args = append(args, "-vf", filter, "-r", formatFPS(fps), "-fps_mode", "cfr")
+		args = append(args, "-vf", filter, "-fps_mode", "passthrough")
 		args = append(args, opts.Encoder.Args...)
 		if opts.Probe.HasAudio {
-			if copyAudio(opts.Probe.AudioCodec) {
-				args = append(args, "-c:a", "copy")
+			if speed {
+				args = append(args, "-af", BuildAtempo(speedups, windowDuration), "-c:a", "aac", "-b:a", "192k")
 			} else {
-				args = append(args, "-c:a", "aac", "-b:a", "192k")
+				args = append(args, "-af", "asetpts=PTS-STARTPTS", "-c:a", "aac", "-b:a", "192k")
 			}
 		} else {
 			args = append(args, "-an")
@@ -148,7 +204,7 @@ func Export(ctx context.Context, opts ExportOpts, progress ProgressFunc) error {
 		}
 	}()
 
-	duration := opts.Probe.Duration
+	duration := OutputDuration(windowDuration, speedups)
 	sc := bufio.NewScanner(stdout)
 	sc.Buffer(make([]byte, 0, 64*1024), 1024*1024)
 	var lastT float64
@@ -191,15 +247,6 @@ func Export(ctx context.Context, opts ExportOpts, progress ProgressFunc) error {
 		return fmt.Errorf("ffmpeg: %w", wrapExecErr(waitErr))
 	}
 	return nil
-}
-
-func copyAudio(codec string) bool {
-	switch strings.ToLower(codec) {
-	case "aac", "mp3", "opus", "ac3", "eac3":
-		return true
-	default:
-		return false
-	}
 }
 
 func usefulLog(line string) bool {
